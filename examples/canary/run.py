@@ -988,11 +988,11 @@ def decode_wav_file(input_file_path,
                                                    [len(waveform)] * batch_size,
                                                    text_prefix, num_beams,
                                                    max_new_tokens)
-    if predictions is None:
+    if model.use_inflight_batching:
         predictions = []
         for request_id in request_ids:
             predictions.append(model.get_response(request_id))
-    model.shutdown()
+        model.shutdown()
     predictions = model.decode(predictions)
     prediction = predictions[0]
 
