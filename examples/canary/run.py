@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 from string import punctuation
+from threading import Lock, Thread
 
 import librosa
 import numpy
@@ -36,6 +38,7 @@ import tensorrt_llm
 import tensorrt_llm.logger as logger
 from tensorrt_llm._utils import str_dtype_to_torch, trt_dtype_to_torch
 from tensorrt_llm.bindings import KVCacheType
+from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.runtime import (PYTHON_BINDINGS, ModelConfig, ModelRunnerCpp,
                                   SamplingConfig)
 from tensorrt_llm.runtime.session import Session, TensorInfo
@@ -73,6 +76,9 @@ def parse_arguments():
     parser.add_argument('--use_py_session',
                         action='store_true',
                         help="use python session or cpp session")
+    parser.add_argument('--use_inflight_batching',
+                        action='store_true',
+                        help="use inflight batching or not")
     return parser.parse_args()
 
 
@@ -117,13 +123,16 @@ def unpack_tensors(input_tensors, input_tensor_lengths):
     return output_tensors
 
 
-def read_config(component, engine_dir):
+def read_config(component, engine_dir, mode='decoder'):
     config_path = engine_dir / component / 'config.json'
     with open(config_path, 'r') as f:
         config = json.load(f)
     model_config = OrderedDict()
-    model_config.update(config['pretrained_config'])
-    model_config.update(config['build_config'])
+    if mode == 'decoder':
+        model_config.update(config['pretrained_config'])
+        model_config.update(config['build_config'])
+    else:
+        model_config.update(config)
     return model_config
 
 
@@ -469,7 +478,8 @@ class CanaryDecoding:
                  tokenizer,
                  debug_mode=False,
                  device="cuda:0",
-                 use_py_session=False):
+                 use_py_session=False,
+                 use_inflight_batching=False):
         self.tokenizer = tokenizer
         self.decoder_config = read_config('decoder', engine_dir)
         self.prompt_format = self.decoder_config['prompt_format']
@@ -479,9 +489,62 @@ class CanaryDecoding:
         self.max_input_len = self.decoder_config['max_input_len']
         self.device = device
         self.use_py_session = use_py_session
-
+        self.use_inflight_batching = use_inflight_batching
         self.decoder_generation_session = self.get_session(
             engine_dir, runtime_mapping, debug_mode, use_py_session)
+
+        if use_py_session and use_inflight_batching:
+            print(
+                '[WARNING] Inflight batching is not supported for python session'
+            )
+            self.use_inflight_batching = False
+
+        if use_inflight_batching:
+            self.lock = Lock()
+            self.pending_requests = set()
+            self.outputs = {}
+            self.awaiter_thread = Thread(target=self.awaiter_thread_fn)
+            self.startup()
+
+    def startup(self):
+        self.running = True
+        self.pending_requests = set()
+        self.outputs = {}
+        self.awaiter_thread.start()
+
+    def shutdown(self):
+        while True:
+            # Wait till the sent requests are completed.
+            with self.lock:
+                if len(self.pending_requests) == 0:
+                    break
+                else:
+                    print(
+                        f'Waiting for {len(self.pending_requests)} requests to complete'
+                    )
+            time.sleep(0.01)
+        self.running = False
+        self.awaiter_thread.join()
+
+    def awaiter_thread_fn(self):
+        while self.running:
+            responses = self.decoder_generation_session.session.await_responses(
+            )
+            for response in responses:
+                if response.result.is_final:
+                    with self.lock:
+                        self.outputs[
+                            response.
+                            request_id] = response.result.output_token_ids
+                        self.pending_requests.remove(response.request_id)
+            time.sleep(0.01)
+
+    def get_response(self, request_id):
+        while True:
+            with self.lock:
+                if request_id in self.outputs:
+                    return self.outputs[request_id]
+            time.sleep(0.01)
 
     @staticmethod
     def get_x_attention_mask(lens, max_length):
@@ -547,6 +610,103 @@ class CanaryDecoding:
             return self.get_py_session(engine_dir, runtime_mapping, debug_mode)
         else:
             return self.get_cpp_session(engine_dir, runtime_mapping, debug_mode)
+
+    @staticmethod
+    def get_sampling_config(batch_size, **kwargs):
+        accepted_parameters = [
+            "num_beams",
+            "top_k",
+            "top_p",
+            "top_p_min",
+            "top_p_reset_ids",
+            "top_p_decay",
+            "temperature",
+            "min_tokens",
+            "beam_search_diversity_rate",
+            "repetition_penalty",
+            "presence_penalty",
+            "frequency_penalty",
+            "length_penalty",
+            "early_stopping",
+            "no_repeat_ngram_size",
+            "random_seed",
+            "num_return_sequences",
+            "min_p",
+            "beam_width_array",
+        ]
+        rename_params = {"num_beams": "beam_width", "random_seed": "seed"}
+        sampling_params = {
+            k: v
+            for k, v in kwargs.items() if k in accepted_parameters
+        }
+        for k, v in rename_params.items():
+            if k in sampling_params:
+                sampling_params[v] = sampling_params.pop(k)
+        if "top_p" in sampling_params and sampling_params["top_p"] == 0.0:
+            sampling_params["top_p"] = None
+
+        # TODO: improve usage of SamplingConfig. For example,
+        # construct SamplingConfig for each request, rather than one for the whole batch.
+        # Here we use beam width array for each request for Variable-Beam-Width-Search.
+        # Just placeholder for non-Variable-Beam-Width-Search
+        sampling_config_list = [None] * batch_size
+        if "beam_width_array" in sampling_params and sampling_params[
+                "beam_width_array"] is not None and len(
+                    sampling_params["beam_width_array"]) == batch_size:
+            sp_copy = copy.deepcopy(sampling_params)
+            for i in range(batch_size):
+                bwa = sampling_params["beam_width_array"][i]
+                sp_copy["beam_width_array"] = bwa
+                sp_copy["beam_width"] = max(bwa)
+                sampling_config_list[i] = trtllm.SamplingConfig(**sp_copy)
+            # Just placeholder for Variable-Beam-Width-Search and for `self._check_inputs`
+            max_beam_width = max(sc.beam_width for sc in sampling_config_list)
+            sampling_params["beam_width"] = max_beam_width
+            sampling_params["beam_width_array"] = [max_beam_width] * 8
+        sampling_config = trtllm.SamplingConfig(**sampling_params)
+        return sampling_config
+
+    @staticmethod
+    def create_request(input_ids,
+                       encoder_input_feature,
+                       encoder_output_length,
+                       cross_attention_mask,
+                       max_new_tokens,
+                       end_id,
+                       pad_id,
+                       num_beams,
+                       batch_size=1):
+        output_config = trtllm.OutputConfig(
+            return_context_logits=False,
+            return_generation_logits=False,
+            return_log_probs=False,
+        )
+        request = trtllm.Request(
+            input_token_ids=input_ids.tolist(),
+            encoder_input_token_ids=None,
+            encoder_output_length=encoder_output_length.item(),
+            encoder_input_features=encoder_input_feature.contiguous(),
+            position_ids=None,
+            cross_attention_mask=cross_attention_mask.contiguous(),
+            max_tokens=max_new_tokens,
+            pad_id=pad_id,
+            end_id=end_id,
+            stop_words=None,
+            bad_words=None,
+            sampling_config=CanaryDecoding.get_sampling_config(
+                batch_size, num_beams=num_beams),
+            lookahead_config=None,
+            streaming=False,
+            output_config=output_config,
+            prompt_tuning_config=None,
+            mrope_config=None,
+            lora_config=None,
+            return_all_generated_tokens=False,
+            logits_post_processor_name=None,
+            external_draft_tokens_config=None,
+            skip_cross_attn_blocks=None,
+        )
+        return request
 
     def generate(self,
                  decoder_input_ids,
@@ -617,6 +777,9 @@ class CanaryDecoding:
                 cross_attention_mask=cross_attention_mask,
             )
             torch.cuda.synchronize()
+            # get the list of int from output_ids tensor
+            output_ids = output_ids.cpu().numpy().tolist()
+            return output_ids, None
         else:
             cross_attention_masks = [
                 torch.ones([
@@ -630,23 +793,44 @@ class CanaryDecoding:
                                                decoder_input_lengths)
             encoder_outputs = unpack_tensors(encoder_outputs,
                                              encoder_input_lengths)
-            out = self.decoder_generation_session.generate(
-                batch_input_ids=decoder_input_ids,
-                encoder_input_features=encoder_outputs,
-                encoder_output_lengths=encoder_input_lengths,
-                cross_attention_masks=cross_attention_masks,
-                max_new_tokens=max_new_tokens,
-                end_id=self.tokenizer.eos_id,
-                pad_id=self.tokenizer.pad_id,
-                num_beams=num_beams,
-                output_sequence_lengths=True,
-                return_dict=True)
-            output_ids = out['output_ids']
-            out['sequence_lengths']
+            if self.use_inflight_batching:
+                requests = []
+                for i in range(batch_size):
+                    requests.append(
+                        self.create_request(
+                            decoder_input_ids[i],
+                            encoder_outputs[i],
+                            encoder_input_lengths[i],
+                            cross_attention_masks[i],
+                            max_new_tokens,
+                            self.tokenizer.eos_id,
+                            self.tokenizer.pad_id,
+                            num_beams,
+                            batch_size=self.decoder_generation_session.
+                            max_batch_size))
+                request_ids = self.decoder_generation_session.session.enqueue_requests(
+                    requests)
+                with self.lock:
+                    self.pending_requests.update(set(request_ids))
+                    return None, request_ids
+            else:
+                out = self.decoder_generation_session.generate(
+                    batch_input_ids=decoder_input_ids,
+                    encoder_input_features=encoder_outputs,
+                    encoder_output_lengths=encoder_input_lengths,
+                    cross_attention_masks=cross_attention_masks,
+                    max_new_tokens=max_new_tokens,
+                    end_id=self.tokenizer.eos_id,
+                    pad_id=self.tokenizer.pad_id,
+                    num_beams=num_beams,
+                    output_sequence_lengths=True,
+                    return_dict=True)
+                output_ids = out['output_ids']
+                out['sequence_lengths']
 
-        # get the list of int from output_ids tensor
-        output_ids = output_ids.cpu().numpy().tolist()
-        return output_ids
+                # get the list of int from output_ids tensor
+                output_ids = output_ids.cpu().numpy().tolist()
+                return output_ids, None
 
 
 class CanaryTRTLLM(object):
@@ -657,7 +841,8 @@ class CanaryTRTLLM(object):
                  device="cuda:0",
                  batch_size=8,
                  num_beams=1,
-                 use_py_session=False):
+                 use_py_session=False,
+                 use_inflight_batching=False):
 
         self.device = device
         world_size = 1
@@ -665,14 +850,26 @@ class CanaryTRTLLM(object):
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
         torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
         engine_dir = Path(engine_dir)
-        read_config('decoder', engine_dir)
+
         with open(os.path.join(engine_dir, 'preprocessor/config.json')) as f:
             preprocessor_config = json.load(f)
 
+        self.encoder_config = read_config('encoder', engine_dir, mode='encoder')
         self.decoder_config = read_config('decoder', engine_dir)
         self.max_seq_len = self.decoder_config['max_seq_len']
         self.max_input_len = self.decoder_config['max_input_len']
-        self.max_batch_size = self.decoder_config['max_batch_size']
+        self.max_batch_size = self.encoder_config['max_batch_size']
+        if self.encoder_config['max_batch_size'] != self.decoder_config[
+                'max_batch_size']:
+            print(
+                f'[WARNING] Encoder and decoder max batch size mismatch ({self.encoder_config["max_batch_size"]} vs. {self.decoder_config["max_batch_size"]})'
+            )
+            if use_py_session:
+                self.max_batch_size = min(self.encoder_config['max_batch_size'],
+                                          self.decoder_config['max_batch_size'])
+                print(
+                    f'[WARNING] Python session cannot handle different max batch sizes for encoder and decoder, setting max batch size to {self.max_batch_size}'
+                )
 
         self.num_feats = preprocessor_config['features']
         self.n_fft = preprocessor_config['n_fft']
@@ -695,12 +892,14 @@ class CanaryTRTLLM(object):
                                                preemp=preemp)
         self.tokenizer = CanaryTokenizer(engine_dir)
         self.encoder = CanaryEncoder(engine_dir)
-        self.decoder = CanaryDecoding(engine_dir,
-                                      runtime_mapping,
-                                      tokenizer=self.tokenizer,
-                                      debug_mode=debug_mode,
-                                      device=self.device,
-                                      use_py_session=use_py_session)
+        self.decoder = CanaryDecoding(
+            engine_dir,
+            runtime_mapping,
+            tokenizer=self.tokenizer,
+            debug_mode=debug_mode,
+            device=self.device,
+            use_py_session=use_py_session,
+            use_inflight_batching=use_inflight_batching)
 
         self.use_py_session = use_py_session
 
@@ -741,18 +940,35 @@ class CanaryTRTLLM(object):
 
         encoder_output, encoder_output_lengths = self.encoder.infer(
             mel, mel_input_lengths, stream)
-        output_ids = self.decoder.generate(decoder_input_ids,
-                                           encoder_output,
-                                           encoder_output_lengths,
-                                           max_new_tokens=max_new_tokens,
-                                           num_beams=num_beams)
+        output_ids, request_ids = self.decoder.generate(
+            decoder_input_ids,
+            encoder_output,
+            encoder_output_lengths,
+            max_new_tokens=max_new_tokens,
+            num_beams=num_beams)
 
+        return output_ids, request_ids
+
+    @property
+    def use_inflight_batching(self):
+        return self.decoder.use_inflight_batching
+
+    def decode(self, output_ids):
         texts = []
         for i in range(len(output_ids)):
             text = self.tokenizer.decode(output_ids[i][0]).strip()
             text = text.lstrip(punctuation)
             texts.append(text)
         return texts
+
+    def startup(self):
+        self.decoder.startup()
+
+    def shutdown(self):
+        self.decoder.shutdown()
+
+    def get_response(self, request_id):
+        return self.decoder.get_response(request_id)
 
 
 def decode_wav_file(input_file_path,
@@ -768,10 +984,16 @@ def decode_wav_file(input_file_path,
     waveform = torch.from_numpy(waveform).to(dtype=torch.float32,
                                              device="cuda:0")
 
-    predictions = model.process_batch([waveform] * batch_size,
-                                      [len(waveform)] * batch_size, text_prefix,
-                                      num_beams, max_new_tokens)
-
+    predictions, request_ids = model.process_batch([waveform] * batch_size,
+                                                   [len(waveform)] * batch_size,
+                                                   text_prefix, num_beams,
+                                                   max_new_tokens)
+    if predictions is None:
+        predictions = []
+        for request_id in request_ids:
+            predictions.append(model.get_response(request_id))
+    model.shutdown()
+    predictions = model.decode(predictions)
     prediction = predictions[0]
 
     # remove all special tokens in the prediction
@@ -843,22 +1065,7 @@ def decode_manifest(manifest_file,
     total_duration = 0
     total_batches = 0
 
-    for waveforms, durations, texts, ids, prompt_cfg, max_batch_len in batch_manifest(
-            manifest_file, batch_size):
-        for idx in range(len(waveforms)):
-            max_batch_len = max(max_batch_len, sample_rate * 3)
-            waveform = pad_or_trim(waveforms[idx], max_batch_len)
-
-            waveform = waveform.astype(np.float32)
-            waveform = torch.from_numpy(waveform)
-            waveforms[idx] = waveform
-
-        total_duration += sum(durations) / sample_rate
-        predictions = model.process_batch(waveforms,
-                                          durations,
-                                          num_beams=num_beams,
-                                          max_new_tokens=max_new_tokens,
-                                          prompts_cfg=prompt_cfg)
+    def post_process(predictions, ids, texts, prompt_cfg):
         for wav_id, label, prediction, cfg in zip(ids, texts, predictions,
                                                   prompt_cfg):
             # remove all special tokens in the prediction
@@ -879,10 +1086,51 @@ def decode_manifest(manifest_file,
             if output_manifest is not None:
                 output_manifest.append(data)
 
-            total_batches += 1
+    if model.use_inflight_batching:
+        # Global variables to store the results for in-flight batching
+        request_ids_global = []
+        ids_global = []
+        texts_global = []
+        prompt_cfg_global = []
 
+    for waveforms, durations, texts, ids, prompt_cfg, max_batch_len in batch_manifest(
+            manifest_file, batch_size):
+        for idx in range(len(waveforms)):
+            max_batch_len = max(max_batch_len, sample_rate * 3)
+            waveform = pad_or_trim(waveforms[idx], max_batch_len)
+
+            waveform = waveform.astype(np.float32)
+            waveform = torch.from_numpy(waveform)
+            waveforms[idx] = waveform
+
+        total_duration += sum(durations) / sample_rate
+        predictions, request_ids = model.process_batch(
+            waveforms,
+            durations,
+            num_beams=num_beams,
+            max_new_tokens=max_new_tokens,
+            prompts_cfg=prompt_cfg)
+        total_batches += 1
+
+        if model.use_inflight_batching:
+            request_ids_global.extend(request_ids)
+            ids_global.extend(ids)
+            texts_global.extend(texts)
+            prompt_cfg_global.extend(prompt_cfg)
+        else:
+            assert predictions is not None
+            predictions = model.decode(predictions)
+            post_process(predictions, ids, texts, prompt_cfg)
             if warmstart_batches is not None and total_batches >= warmstart_batches:
                 return results, total_duration
+
+    if model.use_inflight_batching:
+        model.shutdown()
+        predictions = []
+        for request_id in request_ids_global:
+            predictions.append(model.get_response(request_id))
+        predictions = model.decode(predictions)
+        post_process(predictions, ids_global, texts_global, prompt_cfg_global)
 
     return results, total_duration
 
@@ -918,8 +1166,29 @@ def decode_dataset(model,
                              collate_fn=collate_wrapper)
     results = []
     total_duration = 0
+
+    def post_process(predictions, ids, texts):
+        for wav_id, label, prediction in zip(ids, texts, predictions):
+            # remove all special tokens in the prediction
+            prediction = re.sub(r'<\|.*?\|>', '', prediction)
+            results.append(
+                (wav_id, label.lower().split(), prediction.lower().split()))
+
+    if model.use_inflight_batching:
+        request_ids_global = []
+        ids_global = []
+        texts_global = []
+
     start_time = time.time()
     for batch in data_loader:
+        while True:
+            with model.lock:
+                pending_count = len(model.decoder.pending_requests)
+            if pending_count > 512:
+                time.sleep(0.01)
+            else:
+                break
+
         waveforms, durations, texts, ids = batch
         total_duration += sum(durations) / sample_rate
         max_durations = max(durations)
@@ -930,15 +1199,27 @@ def decode_dataset(model,
             waveform = pad_or_trim(waveforms[idx], max_batch_len)
             waveforms_list.append(waveform)
 
-        predictions = model.process_batch(waveforms_list, durations,
-                                          text_prefix, num_beams,
-                                          max_new_tokens)
-        for wav_id, label, prediction in zip(ids, texts, predictions):
-            # remove all special tokens in the prediction
-            prediction = re.sub(r'<\|.*?\|>', '', prediction)
+        predictions, request_ids = model.process_batch(waveforms_list,
+                                                       durations, text_prefix,
+                                                       num_beams,
+                                                       max_new_tokens)
+        if model.use_inflight_batching:
+            request_ids_global.extend(request_ids)
+            ids_global.extend(ids)
+            texts_global.extend(texts)
+        else:
+            assert predictions is not None
+            predictions = model.decode(predictions)
+            post_process(predictions, ids, texts)
 
-            results.append(
-                (wav_id, label.lower().split(), prediction.lower().split()))
+    if model.use_inflight_batching:
+        model.shutdown()
+        predictions = []
+        for request_id in request_ids_global:
+            predictions.append(model.get_response(request_id))
+        predictions = model.decode(predictions)
+        post_process(predictions, ids_global, texts_global)
+
     return results, total_duration, start_time
 
 
@@ -950,6 +1231,7 @@ if __name__ == '__main__':
                          debug_mode=args.debug,
                          device="cuda:0",
                          use_py_session=args.use_py_session,
+                         use_inflight_batching=args.use_inflight_batching,
                          batch_size=args.batch_size,
                          num_beams=args.num_beams)
 
