@@ -327,286 +327,159 @@ class CanaryModel:
     def convert_decoder(self):
         self.model.transf_decoder.freeze()
 
-        def create_weight_dict():
-            if Version(tensorrt_llm.__version__) >= Version("0.18.0"):
-                weights = {}
-                self.model.transf_decoder.to(dtype=TORCH_DTYPES[self.dtype])
-                model_params = self.model.transf_decoder.state_dict()
-                lm_head = self.model.log_softmax.state_dict()
-
-                assert torch.equal(
-                    lm_head['mlp.layer0.weight'],
-                    model_params['_embedding.token_embedding.weight'])
-
-                weights['transformer.vocab_embedding.weight'] = model_params[
-                    '_embedding.token_embedding.weight'].contiguous().clone()
-                weights['lm_head.weight'] = lm_head[
-                    'mlp.layer0.weight'].contiguous()
-                weights['lm_head.bias'] = lm_head['mlp.layer0.bias'].contiguous(
-                )
-                weights['transformer.position_embedding.weight'] = model_params[
-                    '_embedding.position_embedding.pos_enc'].contiguous()
-                weights['transformer.ln_embed.weight'] = model_params[
-                    '_embedding.layer_norm.weight'].contiguous()
-                weights['transformer.ln_embed.bias'] = model_params[
-                    '_embedding.layer_norm.bias'].contiguous()
-
-                for i in range(self.config['decoder_layers']):
-                    trtllm_layer_name_prefix = f'transformer.layers.{i}'
-                    #layer_norm_1 aka self_attention_layernorm
-                    weights[f'{trtllm_layer_name_prefix}.self_attention_layernorm.weight'] =  \
-                        model_params[f'_decoder.layers.{i}.layer_norm_1.weight'].contiguous()
-                    weights[
-                        f'{trtllm_layer_name_prefix}.self_attention_layernorm.bias'] = \
-                        model_params[f'_decoder.layers.{i}.layer_norm_1.bias'].contiguous()
-
-                    #first_sub_layer
-                    t = torch.cat(
-                        [
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.query_net.weight'],
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.key_net.weight'],
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.value_net.weight'],
-                        ],
-                        dim=0,
-                    ).contiguous()
-                    dst = weights[
-                        f'{trtllm_layer_name_prefix}.self_attention.qkv.weight'] = t
-                    t = model_params[
-                        f'_decoder.layers.{i}.first_sub_layer.out_projection.weight'].contiguous(
-                        )
-                    dst = weights[
-                        f'{trtllm_layer_name_prefix}.self_attention.dense.weight'] = t
-
-                    weights[f'{trtllm_layer_name_prefix}.self_attention.qkv.bias'] = torch.cat(
-                        [
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.query_net.bias'],
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.key_net.bias'],
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.value_net.bias'],
-                        ],
-                        dim=0).contiguous()
-
-                    weights[f'{trtllm_layer_name_prefix}.self_attention.dense.bias'] =  \
-                        model_params[f'_decoder.layers.{i}.first_sub_layer.out_projection.bias'].contiguous()
-
-                    #layer_norm_2 aka cross_attention_layernorm
-                    weights[f'{trtllm_layer_name_prefix}.cross_attention_layernorm.weight'] = \
-                        model_params[f'_decoder.layers.{i}.layer_norm_2.weight'].contiguous()
-                    weights[
-                        f'{trtllm_layer_name_prefix}.cross_attention_layernorm.bias'] = \
-                        model_params[f'_decoder.layers.{i}.layer_norm_2.bias'].contiguous()
-
-                    #second_sub_layer
-                    t = torch.cat(
-                        [
-                            model_params[
-                                f'_decoder.layers.{i}.second_sub_layer.query_net.weight'],
-                            model_params[
-                                f'_decoder.layers.{i}.second_sub_layer.key_net.weight'],
-                            model_params[
-                                f'_decoder.layers.{i}.second_sub_layer.value_net.weight'],
-                        ],
-                        dim=0,
-                    ).contiguous()
-
-                    dst = weights[
-                        f'{trtllm_layer_name_prefix}.cross_attention.qkv.weight'] = t
-
-                    t = model_params[
-                        f'_decoder.layers.{i}.second_sub_layer.out_projection.weight'].contiguous(
-                        )
-
-                    dst = weights[
-                        f'{trtllm_layer_name_prefix}.cross_attention.dense.weight'] = t
-
-                    cross_attn_qkv_bias = torch.cat([
-                        model_params[
-                            f'_decoder.layers.{i}.second_sub_layer.query_net.bias'],
-                        model_params[
-                            f'_decoder.layers.{i}.second_sub_layer.key_net.bias'],
-                        model_params[
-                            f'_decoder.layers.{i}.second_sub_layer.value_net.bias'],
-                    ],
-                                                    dim=0).contiguous()
-                    weights[
-                        f'{trtllm_layer_name_prefix}.cross_attention.qkv.bias'] = cross_attn_qkv_bias
-                    weights[f'{trtllm_layer_name_prefix}.cross_attention.dense.bias'] = \
-                        model_params[f'_decoder.layers.{i}.second_sub_layer.out_projection.bias'].contiguous()
-
-                    #layer_norm_3
-                    weights[f'{trtllm_layer_name_prefix}.mlp_layernorm.weight'] = \
-                        model_params[f'_decoder.layers.{i}.layer_norm_3.weight'].contiguous()
-                    weights[f'{trtllm_layer_name_prefix}.mlp_layernorm.bias'] = \
-                        model_params[f'_decoder.layers.{i}.layer_norm_3.bias'].contiguous()
-
-                    #third_sub_layer
-                    t = model_params[
-                        f'_decoder.layers.{i}.third_sub_layer.dense_in.weight'].contiguous(
-                        )
-                    weights[f'{trtllm_layer_name_prefix}.mlp.fc.weight'] = t
-                    t = model_params[
-                        f'_decoder.layers.{i}.third_sub_layer.dense_out.weight'].contiguous(
-                        )
-                    weights[f'{trtllm_layer_name_prefix}.mlp.proj.weight'] = t
-
-                    weights[f'{trtllm_layer_name_prefix}.mlp.fc.bias'] = \
-                        model_params[f'_decoder.layers.{i}.third_sub_layer.dense_in.bias'].contiguous()
-                    weights[f'{trtllm_layer_name_prefix}.mlp.proj.bias'] = \
-                        model_params[f'_decoder.layers.{i}.third_sub_layer.dense_out.bias'].contiguous()
-
-                weights['transformer.ln_f.weight'] = model_params[
-                    '_decoder.final_layer_norm.weight'].contiguous()
-                weights['transformer.ln_f.bias'] = model_params[
-                    '_decoder.final_layer_norm.bias'].contiguous()
-            elif Version(tensorrt_llm.__version__) >= Version("0.17.0"):
-                weights = {}
-                self.model.transf_decoder.to(dtype=TORCH_DTYPES[self.dtype])
-                model_params = self.model.transf_decoder.state_dict()
-                lm_head = self.model.log_softmax.state_dict()
-                #model_params.update(self.model.log_softmax.state_dict())
-
-                assert torch.equal(
-                    lm_head['mlp.layer0.weight'],
-                    model_params['_embedding.token_embedding.weight'])
-
-                weights['embedding.vocab_embedding.weight'] = model_params[
-                    '_embedding.token_embedding.weight'].contiguous().clone()
-                weights['lm_head.weight'] = lm_head[
-                    'mlp.layer0.weight'].contiguous()
-                weights['lm_head.bias'] = lm_head['mlp.layer0.bias'].contiguous(
-                )
-                weights['embedding.position_embedding.weight'] = model_params[
-                    '_embedding.position_embedding.pos_enc'].contiguous()
-                weights['embedding.embedding_layernorm.weight'] = model_params[
-                    '_embedding.layer_norm.weight'].contiguous()
-                weights['embedding.embedding_layernorm.bias'] = model_params[
-                    '_embedding.layer_norm.bias'].contiguous()
-
-                for i in range(self.config['decoder_layers']):
-
-                    #layer_norm_1 aka self_attention_layernorm
-                    weights[f'decoder_layers.{i}.self_attention_layernorm.weight'] =  \
-                        model_params[f'_decoder.layers.{i}.layer_norm_1.weight'].contiguous()
-                    weights[
-                        f'decoder_layers.{i}.self_attention_layernorm.bias'] = \
-                        model_params[f'_decoder.layers.{i}.layer_norm_1.bias'].contiguous()
-
-                    #first_sub_layer
-                    t = torch.cat(
-                        [
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.query_net.weight'],
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.key_net.weight'],
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.value_net.weight'],
-                        ],
-                        dim=0,
-                    ).contiguous()
-                    dst = weights[
-                        f'decoder_layers.{i}.self_attention.qkv.weight'] = t
-                    t = model_params[
-                        f'_decoder.layers.{i}.first_sub_layer.out_projection.weight'].contiguous(
-                        )
-                    dst = weights[
-                        f'decoder_layers.{i}.self_attention.dense.weight'] = t
-
-                    weights[f'decoder_layers.{i}.self_attention.qkv.bias'] = torch.cat(
-                        [
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.query_net.bias'],
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.key_net.bias'],
-                            model_params[
-                                f'_decoder.layers.{i}.first_sub_layer.value_net.bias'],
-                        ],
-                        dim=0).contiguous()
-
-                    weights[f'decoder_layers.{i}.self_attention.dense.bias'] =  \
-                        model_params[f'_decoder.layers.{i}.first_sub_layer.out_projection.bias'].contiguous()
-
-                    #layer_norm_2 aka cross_attention_layernorm
-                    weights[f'decoder_layers.{i}.cross_attention_layernorm.weight'] = \
-                        model_params[f'_decoder.layers.{i}.layer_norm_2.weight'].contiguous()
-                    weights[
-                        f'decoder_layers.{i}.cross_attention_layernorm.bias'] = \
-                        model_params[f'_decoder.layers.{i}.layer_norm_2.bias'].contiguous()
-
-                    #second_sub_layer
-                    t = torch.cat(
-                        [
-                            model_params[
-                                f'_decoder.layers.{i}.second_sub_layer.query_net.weight'],
-                            model_params[
-                                f'_decoder.layers.{i}.second_sub_layer.key_net.weight'],
-                            model_params[
-                                f'_decoder.layers.{i}.second_sub_layer.value_net.weight'],
-                        ],
-                        dim=0,
-                    ).contiguous()
-
-                    dst = weights[
-                        f'decoder_layers.{i}.cross_attention.qkv.weight'] = t
-
-                    t = model_params[
-                        f'_decoder.layers.{i}.second_sub_layer.out_projection.weight'].contiguous(
-                        )
-
-                    dst = weights[
-                        f'decoder_layers.{i}.cross_attention.dense.weight'] = t
-
-                    cross_attn_qkv_bias = torch.cat([
-                        model_params[
-                            f'_decoder.layers.{i}.second_sub_layer.query_net.bias'],
-                        model_params[
-                            f'_decoder.layers.{i}.second_sub_layer.key_net.bias'],
-                        model_params[
-                            f'_decoder.layers.{i}.second_sub_layer.value_net.bias'],
-                    ],
-                                                    dim=0).contiguous()
-                    weights[
-                        f'decoder_layers.{i}.cross_attention.qkv.bias'] = cross_attn_qkv_bias
-                    weights[f'decoder_layers.{i}.cross_attention.dense.bias'] = \
-                        model_params[f'_decoder.layers.{i}.second_sub_layer.out_projection.bias'].contiguous()
-
-                    #layer_norm_3
-                    weights[f'decoder_layers.{i}.mlp_layernorm.weight'] = \
-                        model_params[f'_decoder.layers.{i}.layer_norm_3.weight'].contiguous()
-                    weights[f'decoder_layers.{i}.mlp_layernorm.bias'] = \
-                        model_params[f'_decoder.layers.{i}.layer_norm_3.bias'].contiguous()
-
-                    #third_sub_layer
-                    t = model_params[
-                        f'_decoder.layers.{i}.third_sub_layer.dense_in.weight'].contiguous(
-                        )
-                    weights[f'decoder_layers.{i}.mlp.fc.weight'] = t
-                    t = model_params[
-                        f'_decoder.layers.{i}.third_sub_layer.dense_out.weight'].contiguous(
-                        )
-                    weights[f'decoder_layers.{i}.mlp.proj.weight'] = t
-
-                    weights[f'decoder_layers.{i}.mlp.fc.bias'] = \
-                        model_params[f'_decoder.layers.{i}.third_sub_layer.dense_in.bias'].contiguous()
-                    weights[f'decoder_layers.{i}.mlp.proj.bias'] = \
-                        model_params[f'_decoder.layers.{i}.third_sub_layer.dense_out.bias'].contiguous()
-
-                weights['final_layernorm.weight'] = model_params[
-                    '_decoder.final_layer_norm.weight'].contiguous()
-                weights['final_layernorm.bias'] = model_params[
-                    '_decoder.final_layer_norm.bias'].contiguous()
-            else:
-                raise NotImplementedError(
-                    "TensorRT-LLM version must be >= 0.17.0")
-
-            return weights
-
         try:
-            weights = create_weight_dict()
+            weights = {}
+            self.model.transf_decoder.to(dtype=TORCH_DTYPES[self.dtype])
+            model_params = self.model.transf_decoder.state_dict()
+            lm_head = self.model.log_softmax.state_dict()
+
+            assert torch.equal(
+                lm_head['mlp.layer0.weight'],
+                model_params['_embedding.token_embedding.weight'])
+
+            if Version(tensorrt_llm.__version__) < Version("0.17.0"):
+                raise NotImplementedError("TensorRT-LLM version must be >= 0.17.0")
+            elif Version(tensorrt_llm.__version__) < Version("0.19.0alpha"):
+                layer_prefix = "decoder_layers"
+                layer_names = {
+                    'vocab_embedding': 'embedding.vocab_embedding',
+                    'position_embedding': 'embedding.position_embedding',
+                    'embedding_ln': 'embedding.embedding_layernorm',
+                    'final_layernorm': 'final_layernorm'
+                }
+            else:
+                layer_prefix = "transformer.layers"
+                layer_names = {
+                    'vocab_embedding': 'transformer.vocab_embedding',
+                    'position_embedding': 'transformer.position_embedding',
+                    'embedding_ln': 'transformer.ln_embed',
+                    'final_layernorm': 'transformer.ln_f'
+                }
+
+            weights[f'{layer_names["vocab_embedding"]}.weight'] = model_params[
+                '_embedding.token_embedding.weight'].contiguous().clone()
+            weights[f'{layer_names["position_embedding"]}.weight'] = model_params[
+                '_embedding.position_embedding.pos_enc'].contiguous()
+            weights[f'{layer_names["embedding_ln"]}.weight'] = model_params[
+                '_embedding.layer_norm.weight'].contiguous()
+            weights[f'{layer_names["embedding_ln"]}.bias'] = model_params[
+                '_embedding.layer_norm.bias'].contiguous()
+            weights[f'{layer_names["final_layernorm"]}.weight'] = model_params[
+                '_decoder.final_layer_norm.weight'].contiguous()
+            weights[f'{layer_names["final_layernorm"]}.bias'] = model_params[
+                '_decoder.final_layer_norm.bias'].contiguous()
+            weights['lm_head.weight'] = lm_head[
+                'mlp.layer0.weight'].contiguous()
+            weights['lm_head.bias'] = lm_head['mlp.layer0.bias'].contiguous(
+            )
+
+            for i in range(self.config['decoder_layers']):
+                layer_prefix_i = f'{layer_prefix}.{i}'
+                #layer_norm_1 aka self_attention_layernorm
+                weights[f'{layer_prefix_i}.self_attention_layernorm.weight'] =  \
+                    model_params[f'_decoder.layers.{i}.layer_norm_1.weight'].contiguous()
+                weights[
+                    f'{layer_prefix_i}.self_attention_layernorm.bias'] = \
+                    model_params[f'_decoder.layers.{i}.layer_norm_1.bias'].contiguous()
+
+                #first_sub_layer
+                t = torch.cat(
+                    [
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.query_net.weight'],
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.key_net.weight'],
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.value_net.weight'],
+                    ],
+                    dim=0,
+                ).contiguous()
+                dst = weights[
+                    f'{layer_prefix_i}.self_attention.qkv.weight'] = t
+                t = model_params[
+                    f'_decoder.layers.{i}.first_sub_layer.out_projection.weight'].contiguous(
+                    )
+                dst = weights[
+                    f'{layer_prefix_i}.self_attention.dense.weight'] = t
+
+                weights[f'{layer_prefix_i}.self_attention.qkv.bias'] = torch.cat(
+                    [
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.query_net.bias'],
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.key_net.bias'],
+                        model_params[
+                            f'_decoder.layers.{i}.first_sub_layer.value_net.bias'],
+                    ],
+                    dim=0).contiguous()
+
+                weights[f'{layer_prefix_i}.self_attention.dense.bias'] =  \
+                    model_params[f'_decoder.layers.{i}.first_sub_layer.out_projection.bias'].contiguous()
+
+                #layer_norm_2 aka cross_attention_layernorm
+                weights[f'{layer_prefix_i}.cross_attention_layernorm.weight'] = \
+                    model_params[f'_decoder.layers.{i}.layer_norm_2.weight'].contiguous()
+                weights[
+                    f'{layer_prefix_i}.cross_attention_layernorm.bias'] = \
+                    model_params[f'_decoder.layers.{i}.layer_norm_2.bias'].contiguous()
+
+                #second_sub_layer
+                t = torch.cat(
+                    [
+                        model_params[
+                            f'_decoder.layers.{i}.second_sub_layer.query_net.weight'],
+                        model_params[
+                            f'_decoder.layers.{i}.second_sub_layer.key_net.weight'],
+                        model_params[
+                            f'_decoder.layers.{i}.second_sub_layer.value_net.weight'],
+                    ],
+                    dim=0,
+                ).contiguous()
+
+                dst = weights[
+                    f'{layer_prefix_i}.cross_attention.qkv.weight'] = t
+
+                t = model_params[
+                    f'_decoder.layers.{i}.second_sub_layer.out_projection.weight'].contiguous(
+                    )
+
+                dst = weights[
+                    f'{layer_prefix_i}.cross_attention.dense.weight'] = t
+
+                cross_attn_qkv_bias = torch.cat([
+                    model_params[
+                        f'_decoder.layers.{i}.second_sub_layer.query_net.bias'],
+                    model_params[
+                        f'_decoder.layers.{i}.second_sub_layer.key_net.bias'],
+                    model_params[
+                        f'_decoder.layers.{i}.second_sub_layer.value_net.bias'],
+                ],
+                                                dim=0).contiguous()
+                weights[
+                    f'{layer_prefix_i}.cross_attention.qkv.bias'] = cross_attn_qkv_bias
+                weights[f'{layer_prefix_i}.cross_attention.dense.bias'] = \
+                    model_params[f'_decoder.layers.{i}.second_sub_layer.out_projection.bias'].contiguous()
+
+                #layer_norm_3
+                weights[f'{layer_prefix_i}.mlp_layernorm.weight'] = \
+                    model_params[f'_decoder.layers.{i}.layer_norm_3.weight'].contiguous()
+                weights[f'{layer_prefix_i}.mlp_layernorm.bias'] = \
+                    model_params[f'_decoder.layers.{i}.layer_norm_3.bias'].contiguous()
+
+                #third_sub_layer
+                t = model_params[
+                    f'_decoder.layers.{i}.third_sub_layer.dense_in.weight'].contiguous(
+                    )
+                weights[f'{layer_prefix_i}.mlp.fc.weight'] = t
+                t = model_params[
+                    f'_decoder.layers.{i}.third_sub_layer.dense_out.weight'].contiguous(
+                    )
+                weights[f'{layer_prefix_i}.mlp.proj.weight'] = t
+
+                weights[f'{layer_prefix_i}.mlp.fc.bias'] = \
+                    model_params[f'_decoder.layers.{i}.third_sub_layer.dense_in.bias'].contiguous()
+                weights[f'{layer_prefix_i}.mlp.proj.bias'] = \
+                    model_params[f'_decoder.layers.{i}.third_sub_layer.dense_out.bias'].contiguous()
         except Exception as e:
             raise e
         component_save_dir = os.path.join(args.output_dir, "decoder")
