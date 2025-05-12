@@ -79,6 +79,10 @@ def parse_arguments():
     parser.add_argument('--use_inflight_batching',
                         action='store_true',
                         help="use inflight batching or not")
+    parser.add_argument('--max_pending_requests',
+                        type=int,
+                        default=512,
+                        help="maximum number of pending requests when using in-flight batching")
     return parser.parse_args()
 
 
@@ -479,7 +483,8 @@ class CanaryDecoding:
                  debug_mode=False,
                  device="cuda:0",
                  use_py_session=False,
-                 use_inflight_batching=False):
+                 use_inflight_batching=False,
+                 max_pending_requests=512):
         self.tokenizer = tokenizer
         self.decoder_config = read_config('decoder', engine_dir)
         self.prompt_format = self.decoder_config['prompt_format']
@@ -504,6 +509,7 @@ class CanaryDecoding:
             self.pending_requests = set()
             self.outputs = {}
             self.awaiter_thread = Thread(target=self.awaiter_thread_fn)
+            self.max_pending_requests = max_pending_requests
             self.startup()
 
     def startup(self):
@@ -545,6 +551,17 @@ class CanaryDecoding:
                 if request_id in self.outputs:
                     return self.outputs[request_id]
             time.sleep(0.01)
+
+    def wait_for_pending_requests(self, verbose=True):
+        while True:
+            with self.lock:
+                pending_count = len(self.pending_requests)
+            if pending_count > self.max_pending_requests:
+                if verbose:
+                    print(f'Pending requests: {pending_count} > {self.max_pending_requests}')
+                time.sleep(0.01)
+            else:
+                break
 
     @staticmethod
     def get_x_attention_mask(lens, max_length):
@@ -842,7 +859,8 @@ class CanaryTRTLLM(object):
                  batch_size=8,
                  num_beams=1,
                  use_py_session=False,
-                 use_inflight_batching=False):
+                 use_inflight_batching=False,
+                 max_pending_requests=512):
 
         self.device = device
         world_size = 1
@@ -899,7 +917,8 @@ class CanaryTRTLLM(object):
             debug_mode=debug_mode,
             device=self.device,
             use_py_session=use_py_session,
-            use_inflight_batching=use_inflight_batching)
+            use_inflight_batching=use_inflight_batching,
+            max_pending_requests=max_pending_requests)
 
         self.use_py_session = use_py_session
 
@@ -969,6 +988,9 @@ class CanaryTRTLLM(object):
 
     def get_response(self, request_id):
         return self.decoder.get_response(request_id)
+
+    def wait_for_pending_requests(self, verbose=True):
+        self.decoder.wait_for_pending_requests(verbose)
 
 
 def decode_wav_file(input_file_path,
@@ -1095,6 +1117,9 @@ def decode_manifest(manifest_file,
 
     for waveforms, durations, texts, ids, prompt_cfg, max_batch_len in batch_manifest(
             manifest_file, batch_size):
+        if model.use_inflight_batching:
+            model.wait_for_pending_requests()
+
         for idx in range(len(waveforms)):
             max_batch_len = max(max_batch_len, sample_rate * 3)
             waveform = pad_or_trim(waveforms[idx], max_batch_len)
@@ -1181,13 +1206,8 @@ def decode_dataset(model,
 
     start_time = time.time()
     for batch in data_loader:
-        while True:
-            with model.lock:
-                pending_count = len(model.decoder.pending_requests)
-            if pending_count > 512:
-                time.sleep(0.01)
-            else:
-                break
+        if model.use_inflight_batching:
+            model.wait_for_pending_requests()
 
         waveforms, durations, texts, ids = batch
         total_duration += sum(durations) / sample_rate
@@ -1232,6 +1252,7 @@ if __name__ == '__main__':
                          device="cuda:0",
                          use_py_session=args.use_py_session,
                          use_inflight_batching=args.use_inflight_batching,
+                         max_pending_requests=args.max_pending_requests,
                          batch_size=args.batch_size,
                          num_beams=args.num_beams)
 
