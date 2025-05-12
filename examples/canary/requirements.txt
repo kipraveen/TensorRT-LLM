@@ -3,9 +3,9 @@ torch>=2.5.0
 pytorch-lightning>=2.4.0
 safetensors
 kaldialign
-tensorrt_llm==0.19.0rc0
+tensorrt_llm>=0.17.0
 datasets
 lhotse
-nemo_toolkit[asr]==2.3.0rc4
+nemo_toolkit[asr]==2.3.0
 librosa
 protobuf>=4.25.4
