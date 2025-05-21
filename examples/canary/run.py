@@ -15,6 +15,7 @@
 
 import argparse
 import copy
+import datetime
 import json
 import os
 import re
@@ -535,6 +536,7 @@ class CanaryDecoding:
     def awaiter_thread_fn(self):
         while self.running:
             responses = self.decoder_generation_session.session.await_responses(
+                timeout=datetime.timedelta(milliseconds=1)
             )
             for response in responses:
                 if response.result.is_final:
@@ -1043,8 +1045,8 @@ def batch_manifest(manifest_file, batch_size):
             prompt = {
                 'task': data.get('taskname', 'transcribe'),
                 'pnc': data.get('pnc', 'no') == 'yes',
-                'source_language': data.get('source_language', 'en-US'),
-                'target_language': data.get('source_language', 'en-US'),
+                'source_language': data.get('source_lang', 'en-US'),
+                'target_language': data.get('target_lang', 'en-US'),
                 'itn': data.get('itn', "no") == 'yes',
                 'timestamp': data.get('timestamp', "no") == 'yes',
                 'diarize': data.get('diarize', "no") == 'yes',
@@ -1272,25 +1274,47 @@ if __name__ == '__main__':
     if args.manifest_file is not None:
         args.results_dir = Path(args.manifest_file).parent.absolute()
         mf_name = Path(args.manifest_file).stem
-        args.results_manifest = os.path.join(
-            args.results_dir, f"{args.name}_manifest_{mf_name}.json")
+        if args.results_manifest is None:
+            args.results_manifest = os.path.join(
+                args.results_dir, f"{args.name}_manifest_{mf_name}.json")
         log_file = os.path.join(args.results_dir,
                                 f"{args.name}_log_{mf_name}.log")
     if args.results_manifest is not None:
         output_manifest = []
     else:
         output_manifest = None
-    if args.enable_warmup:
-        if args.manifest_file:
-            decode_manifest(args.manifest_file,
-                            model,
-                            batch_size=args.batch_size,
-                            num_beams=args.num_beams,
-                            max_new_tokens=args.max_new_tokens,
-                            output_manifest=None,
-                            warmstart_batches=10)
-        elif args.input_file:
-            decode_wav_file(
+
+    try:
+        if args.enable_warmup:
+            if args.manifest_file:
+                decode_manifest(args.manifest_file,
+                                model,
+                                batch_size=args.batch_size,
+                                num_beams=args.num_beams,
+                                max_new_tokens=args.max_new_tokens,
+                                output_manifest=None,
+                                warmstart_batches=10)
+            elif args.input_file:
+                decode_wav_file(
+                    args.input_file,
+                    model,
+                    text_prefix=args.prompt_text,
+                    batch_size=args.batch_size,
+                    num_beams=args.num_beams,
+                    max_new_tokens=args.max_new_tokens,
+                )
+            else:
+                decode_dataset(
+                    model,
+                    "hf-internal-testing/librispeech_asr_dummy",
+                    batch_size=args.batch_size,
+                    num_beams=args.num_beams,
+                    max_new_tokens=args.max_new_tokens,
+                )
+        if args.input_file:
+            start_time = time.time()
+
+            results, total_duration = decode_wav_file(
                 args.input_file,
                 model,
                 text_prefix=args.prompt_text,
@@ -1298,49 +1322,34 @@ if __name__ == '__main__':
                 num_beams=args.num_beams,
                 max_new_tokens=args.max_new_tokens,
             )
-        else:
-            decode_dataset(
+
+        elif args.manifest_file:
+
+            start_time = time.time()
+
+            results, total_duration = decode_manifest(
+                args.manifest_file,
                 model,
-                "hf-internal-testing/librispeech_asr_dummy",
                 batch_size=args.batch_size,
+                num_beams=args.num_beams,
+                output_manifest=output_manifest,
+                max_new_tokens=args.max_new_tokens,
+            )
+
+        else:
+
+            results, total_duration, start_time = decode_dataset(
+                model,
+                args.dataset,
+                batch_size=args.batch_size,
+                text_prefix=args.prompt_text,
                 num_beams=args.num_beams,
                 max_new_tokens=args.max_new_tokens,
             )
-    if args.input_file:
-        start_time = time.time()
-
-        results, total_duration = decode_wav_file(
-            args.input_file,
-            model,
-            text_prefix=args.prompt_text,
-            batch_size=args.batch_size,
-            num_beams=args.num_beams,
-            max_new_tokens=args.max_new_tokens,
-        )
-
-    elif args.manifest_file:
-
-        start_time = time.time()
-
-        results, total_duration = decode_manifest(
-            args.manifest_file,
-            model,
-            batch_size=args.batch_size,
-            num_beams=args.num_beams,
-            output_manifest=output_manifest,
-            max_new_tokens=args.max_new_tokens,
-        )
-
-    else:
-
-        results, total_duration, start_time = decode_dataset(
-            model,
-            args.dataset,
-            batch_size=args.batch_size,
-            text_prefix=args.prompt_text,
-            num_beams=args.num_beams,
-            max_new_tokens=args.max_new_tokens,
-        )
+    except Exception as e:
+        if args.use_inflight_batching:
+            model.shutdown()
+        raise e
 
     elapsed = time.time() - start_time
     results = sorted(results)
